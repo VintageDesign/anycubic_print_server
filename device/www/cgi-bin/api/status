@@ -1,0 +1,27 @@
+#!/usr/bin/lua
+-- GET /cgi-bin/api/status -> current print state (raw pass-through of comm's state files)
+
+local p = require "printapi"
+
+p.handle_options("GET")
+
+if p.method() ~= "GET" then p.fail(405, "use GET") end
+
+-- Cheap self-healing: un-pause comm / release storage if an earlier request died.
+p.recover_stale()
+
+local msg = p.read_file(p.PRINT_FILES.msg)
+local uptime = tonumber((p.read_file("/proc/uptime") or ""):match("^(%S+)") or "")
+local cache = p.cached_listing()
+
+p.respond(200, {
+	ok          = true,
+	-- print_msg.txt is written by comm while a cloud job is being received/downloaded
+	cloud_job   = msg ~= nil and msg:match("%S") ~= nil,
+	print       = p.raw_json(p.read_file(p.PRINT_FILES.print)) or p.null,
+	local_print = p.raw_json(p.read_file(p.PRINT_FILES.local_print)) or p.null,
+	msg         = p.raw_json(msg) or p.null,
+	storage     = p.storage_state(),       -- {owner="mainboard"|"linux", busy, mounted}
+	files_updated = tonumber((cache or ""):match('"updated":(%d+)')) or p.null,
+	uptime      = uptime or p.null,
+})

@@ -1,0 +1,88 @@
+#!/usr/bin/lua
+-- POST /cgi-bin/api/upload?name=<file>[&overwrite=1]
+-- Body: raw file bytes, e.g.
+--   curl --data-binary @model.pm5s -H 'Content-Type: application/octet-stream' \
+--        "http://printer/cgi-bin/api/upload?name=model.pm5s"
+-- (The stock uhttpd only accepts GET/POST/HEAD, so PUT is not possible.)
+--
+-- The eMMC is borrowed from the mainboard for the duration of the transfer
+-- (the touchscreen's Local tab is unavailable meanwhile) and handed back after.
+
+local p = require "printapi"
+
+p.handle_options("POST")
+
+if p.method() ~= "POST" then p.fail(405, "use POST") end
+
+local q = p.query()
+local name, why = p.safe_name(q.name)
+if not name then p.fail(400, why) end
+
+local len = tonumber(os.getenv("CONTENT_LENGTH") or "")
+if not len or len <= 0 then p.fail(411, "Content-Length required") end
+
+-- Cheap pre-check against the cached free space before borrowing the storage.
+local cached_free = p.cached_free()
+if cached_free and len >= cached_free then p.fail(507, "not enough free space") end
+
+local final = p.STORAGE .. "/" .. name
+local part = p.STORAGE .. "/." .. name .. ".part"
+
+-- Returns http status, body table
+local function store()
+	if p.stat(final) and q.overwrite ~= "1" then
+		return 409, { ok = false, error = "file exists (add &overwrite=1 to replace)" }
+	end
+	local free = p.storage_space()
+	if free and len >= free then return 507, { ok = false, error = "not enough free space" } end
+
+	local out, err = io.open(part, "wb")
+	if not out then return 500, { ok = false, error = "cannot open temp file: " .. tostring(err) } end
+
+	-- Drive the touchscreen's download progress bar like a cloud download does.
+	local last_pct, last_report = 0, os.time()
+	p.report_progress(0, p.PROGRESS_DOWNLOADING)
+	local function fail(status, msg)
+		p.report_progress(last_pct, p.PROGRESS_FAILED)
+		return status, { ok = false, error = msg }
+	end
+
+	local CHUNK = 65536
+	local remaining = len
+	while remaining > 0 do
+		local data = io.stdin:read(remaining < CHUNK and remaining or CHUNK)
+		if not data or #data == 0 then break end
+		local ok, werr = out:write(data)
+		if not ok then
+			out:close()
+			os.remove(part)
+			return fail(500, "write failed: " .. tostring(werr))
+		end
+		remaining = remaining - #data
+		local pct = math.floor((len - remaining) * 100 / len)
+		if pct < 100 and pct ~= last_pct and os.time() - last_report >= 2 then
+			p.report_progress(pct, p.PROGRESS_DOWNLOADING)
+			last_pct, last_report = pct, os.time()
+		end
+	end
+	out:close()
+
+	if remaining ~= 0 then
+		os.remove(part)
+		return fail(400, string.format("short body: got %.0f of %.0f bytes", len - remaining, len))
+	end
+
+	os.execute("sync")
+	local ok, rerr = os.rename(part, final)
+	if not ok then
+		os.remove(part)
+		return fail(500, "rename failed: " .. tostring(rerr))
+	end
+	os.execute("sync")
+	p.report_progress(100, p.PROGRESS_DONE)
+	return 201, { ok = true, name = name, bytes = len }
+end
+
+local ok, status, body = p.with_storage(store)
+if not ok then p.fail(503, status) end
+p.respond(status, body)

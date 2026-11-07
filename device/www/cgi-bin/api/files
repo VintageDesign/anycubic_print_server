@@ -1,0 +1,27 @@
+#!/usr/bin/lua
+-- GET /cgi-bin/api/files            -> cached listing of print files (never touches the eMMC)
+-- GET /cgi-bin/api/files?refresh=1  -> borrow the eMMC, re-read the listing, hand it back
+--
+-- The cache is refreshed automatically by every upload/delete.
+-- Response: {"ok":true,"refreshed":bool,"files":[...],"free":N,"total":N,"updated":epoch|null}
+
+local p = require "printapi"
+
+p.handle_options("GET")
+
+if p.method() ~= "GET" then p.fail(405, "use GET") end
+
+local refreshed = false
+if p.query().refresh == "1" then
+	local ok, err = p.with_storage(function() end)
+	if not ok then p.fail(503, err) end
+	refreshed = true
+end
+
+local cache = p.cached_listing()
+if not cache or not cache:match("^%s*{") then
+	p.respond(200, { ok = true, refreshed = false, updated = p.null, free = p.null,
+	                 total = p.null, files = p.array() })
+end
+-- Splice our fields into the cached object without a JSON decoder.
+p.respond_raw(200, '{"ok":true,"refreshed":' .. tostring(refreshed) .. "," .. cache:match("^%s*{(.*)$"))

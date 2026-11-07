@@ -1,0 +1,37 @@
+#!/usr/bin/lua
+-- POST /cgi-bin/api/delete?name=<file>[&name=<file2>...] -> delete print files from the eMMC
+-- (The stock uhttpd rejects the DELETE method, hence a POST endpoint.)
+-- Several names are handled in one storage handover.
+
+local p = require "printapi"
+
+p.handle_options("POST")
+
+if p.method() ~= "POST" then p.fail(405, "use POST") end
+
+local names = p.query_all("name")
+if #names == 0 then p.fail(400, "missing name") end
+for _, n in ipairs(names) do
+	local ok, why = p.safe_name(n)
+	if not ok then p.fail(400, n .. ": " .. why) end
+end
+
+local deleted, missing, failed = p.array(), p.array(), p.array()
+
+local ok, err = p.with_storage(function()
+	for _, n in ipairs(names) do
+		local path = p.STORAGE .. "/" .. n
+		if not p.stat(path) then
+			missing[#missing + 1] = n
+		elseif os.remove(path) then
+			deleted[#deleted + 1] = n
+		else
+			failed[#failed + 1] = n
+		end
+	end
+	os.execute("sync")
+end)
+if not ok then p.fail(503, err) end
+
+local status = (#failed > 0) and 500 or ((#deleted == 0) and 404 or 200)
+p.respond(status, { ok = status == 200, deleted = deleted, missing = missing, failed = failed })
