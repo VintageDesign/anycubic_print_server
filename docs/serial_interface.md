@@ -77,7 +77,8 @@ Parser behaviour:
 1. Slide through the RX buffer looking for `0x44 0x4D` (`"DM"`).
 2. Read the 16-bit command at offset 2.
 3. If `dir` (offset 4) `== 0`, dispatch `(command - 0x20)` through a 40-entry jump table
-   at **`0x45c800`**; otherwise forward the frame (response path).
+   at **`0x45c800`**; otherwise dispatch `(command - 0x21)` through a second 39-entry table
+   at **`0x45c8a0`** (the answer/response path — see [Response handlers](#response-handlers-dir--0)).
 4. Each command handler knows its fixed frame length and advances the cursor past the
    whole frame before scanning resumes.
 
@@ -107,6 +108,113 @@ handlers' own debug strings.
 Unused / shared default handler (`0x431ce0`): `0x21`–`0x23`, `0x25`–`0x26`, `0x2a`,
 `0x30`–`0x41`, `0x46`.
 
+### Response handlers (`dir != 0`)
+
+Jump table `0x45c800`'s sibling at **`0x45c8a0`**, indexed by `command - 0x21`:
+
+| Cmd | Case | Handler | Meaning |
+|-----|------|---------|---------|
+| `0x21` | `0x431bf0` | `0x4165b4` | |
+| `0x22` | `0x431c00` | `0x424b44` | |
+| `0x23` | `0x431c10` | `0x42615c` | **`do_answer_emmc_change_requet`** — see [eMMC handover](#emmc-handover-command-0x23) |
+| `0x25` | `0x431c20` | `0x42a324` | |
+| `0x2a` | `0x431c30` | `0x42a374` | |
+| `0x2b` | `0x431c40` | `0x42a514` | |
+| `0x2c` | `0x431c50` | `0x42a6b0` | |
+| `0x43` | `0x431c60` | (inline) | `RESIDUAL_REQUET_COMMAND` |
+| `0x44`, `0x45`, `0x47` | `0x431c94`… | | |
+
+## eMMC handover (command `0x23`)
+
+The touchscreen's "Local" storage is an internal eMMC shared by both boards through a mux on
+**GPIO0** (`1` = MT7688/Linux side). The mainboard must be asked to let go of it before GPIO0
+is raised — raising GPIO0 alone makes the eMMC fail to enumerate
+(`mtk-sd: no support for card's volts`, `error -22`).
+
+### Request — `emmc_change_request(int to_linux)` @ `0x414bec`
+
+Builds a **20-byte** frame, `write()`s it straight to the ttyS1 fd (global `0x53ccc0`, under
+mutex `0x540750`), then also queues it via `insertUartMessageToLink` for retransmit-until-ACK:
+
+```
+offset: 0  1  2  3  4  5  6  7  8 .. 19
+bytes : 44 4D 23 00 00 00 0B OO 00 .. 00
+        "DM"  cmd   dir    ?  owner  (zero padding — no checksum)
+```
+
+- `OO` = **`00` → give the eMMC to Linux** (`to_linux != 0`), **`01` → give it back to the
+  mainboard** (`to_linux == 0`).
+- Byte 6 is always `0x0B`. Bytes 8–19 are zero (buffer is `memset`; nothing computes a
+  checksum), which also answers open question 1 for this frame.
+
+Ready-to-send frames:
+
+```
+to Linux     : 44 4D 23 00 00 00 0B 00 00 00 00 00 00 00 00 00 00 00 00 00
+to mainboard : 44 4D 23 00 00 00 0B 01 00 00 00 00 00 00 00 00 00 00 00 00
+```
+
+### Answer — `do_answer_emmc_change_requet` @ `0x42615c`
+
+Mainboard replies with cmd `0x23`, `dir != 0`:
+
+| `[7]` | `[8]` | comm's action |
+|-------|-------|---------------|
+| `0` | `0` | `emmc_state = 1` (log `update emmc state:1`) → Linux may mount |
+| `0` | `1` | `emmc_state = 0`; re-checks files / stops an in-flight download task |
+| `≠0` | `0` | (mainboard-initiated ask) comm re-sends `emmc_change_request(1)` |
+| `≠0` | `1` | (mainboard-initiated ask) comm sends `emmc_change_request(0)` |
+
+State lives in globals under rwlock `0x540788`: `emmc_state` `0x53ccce` (byte), `filecheck`
+`0x53ccc8`, `otafilecheck` `0x53ccc4`; getter `0x40e13c`, setter `0x40e1c8`.
+
+### Full sequence as comm does it
+
+Attach (`check_emmc_mount` @ `0x4294b8`, called from the cloud-download path):
+
+1. `emmc_change_request(1)` (sent earlier by the job handler `0x427cb8`).
+2. Poll `emmc_state` every ~1 s, up to 39 tries, until the answer sets it to 1.
+3. `gpio_high(0)` (`0x402390`) → `sleep(3)` → `sync` → `umount -l /dev/mmcblk0p1` →
+   `mount -t vfat -o iocharset=cp936 /dev/mmcblk0p1 /tmp/run/mountd/mmcblk0p1` → `df` check.
+
+Release (`0x4296fc`, `0x42ece0`, `0x42f65c`, and at start-up in `0x430a14`):
+
+1. (unmount)
+2. `gpio_low(0)` (`0x4023c0`) → `sleep(1–2)`
+3. `emmc_change_request(0)`
+
+Observed live (cloud send, 2026-11-08): job arrives → small UART burst → GPIO0=1 ~1.2 s later →
+eMMC enumerates 0.5 s after that → … → GPIO0=0 → large UART burst (mainboard re-reads its
+file list). See also `docs/http_api.md` § Storage handover.
+
+GPIO helpers: `0x402274` `gpio_write(n, "0"|"1")`, `0x402320` export+direction out+high,
+`0x402390` high, `0x4023c0` low.
+
+## Download progress (command `0x26`)
+
+Drives the touchscreen's download progress bar. Built by `0x414cf8 report_download(pct, state)`
+and `write()`n directly (12 bytes, **not** queued/retransmitted):
+
+```
+offset: 0  1  2  3  4  5  6  7  8  9  10 11
+bytes : 44 4D 26 00 00 00 03 PP SS EE 00 00
+                             PP = percent 0..100
+```
+
+`state` → `(SS, EE)`: 1→`(1,0)` downloading, 2→`(3,0)` done, 3→`(3,1)` MD5 mismatch,
+4→`(2,0)`, 5→`(4,0)`, 6→`(5,0)`, 7→`(6,0)` failed/cancelled, 8→`(7,0)`; other → `(0,0)`.
+
+Senders:
+- Reporter thread `0x42d204`: while the "downloading" flag (`0x53c2b6`) is set, reads progress
+  (`0x53c2b8`), publishes it over MQTT and sends `0x26 (pct, 1)`, then `sleep(5)` — the
+  "+2 UART IRQs every ~5 s" seen during a cloud download.
+- Cloud job handler `0x42f65c`: `(100, 2)` on success (before releasing the eMMC); 4/5/6/7/8 on
+  the various failure paths. `my_download_file` `0x42b310`: `(100,2)` / `(pct,3)` / `(pct,7)`.
+
+Related: `0x4148f4` sends cmd **`0x12`** (95 bytes, `do_ask_report_download_ota_file`) — the
+same idea for firmware downloads: `[7]` = flag, `[8]` = status, `[9..]` = firmware name,
+`[0x51]` = progress.
+
 ### Known payload structs
 
 - **`STARTPRINT_REQUEST` (`0x29`, `0x2d`–`0x2f`)** — the `ptfun_request` struct, 257 bytes:
@@ -133,6 +241,7 @@ Unused / shared default handler (`0x431ce0`): `0x21`–`0x23`, `0x25`–`0x26`, 
    sum / none) and position (trailing byte?) still to confirm.
 2. **`STARTPRINT_REQUEST` field offsets** inside the 257-byte struct.
 3. **`dir` semantics** and full response-frame layout (`code`/`status` placement).
+   (Partly answered: `dir != 0` frames go through the response table at `0x45c8a0`.)
 4. **Variable-length frames** (e.g. `FILELIST_REPORT`) — where the length field is, if the
    payload isn't fixed.
 
